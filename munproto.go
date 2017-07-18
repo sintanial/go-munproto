@@ -9,12 +9,14 @@ import (
 
 var registeredProtos = make(map[string]func(*bufio.Reader) (bool, error))
 
-func Register(proto string, resolver func(*bufio.Reader) (bool, error)) {
+// register new protocol
+func RegisterProto(proto string, resolver func(*bufio.Reader) (bool, error)) {
 	registeredProtos[proto] = resolver
 }
 
-func RegisterDefault() {
-	Register("socks5", func(r *bufio.Reader) (bool, error) {
+// register predefined protocols
+func RegisterProtoDefault() {
+	RegisterProto("socks5", func(r *bufio.Reader) (bool, error) {
 		data, err := r.Peek(1)
 		if err != nil {
 			return false, err
@@ -23,7 +25,7 @@ func RegisterDefault() {
 		return data[0] == byte(5), nil
 	})
 
-	Register("https", func(r *bufio.Reader) (bool, error) {
+	RegisterProto("https", func(r *bufio.Reader) (bool, error) {
 		data, err := r.Peek(1)
 		if err != nil {
 			return false, err
@@ -32,7 +34,7 @@ func RegisterDefault() {
 		return data[0] == byte(22), nil
 	})
 
-	Register("http", func(r *bufio.Reader) (bool, error) {
+	RegisterProto("http", func(r *bufio.Reader) (bool, error) {
 		return true, nil
 	})
 }
@@ -57,8 +59,8 @@ func (self *listener) Close() error {
 
 func newListener(l net.Listener, proto string) *listener {
 	return &listener{
-		l: l,
-		proto: proto,
+		l:      l,
+		proto:  proto,
 		connCh: make(chan net.Conn),
 	}
 }
@@ -68,16 +70,19 @@ type Dispatcher struct {
 	lorder    []string
 	netl      net.Listener
 
-	Logger    *log.Logger
+	Logger *log.Logger
 }
 
 func NewDispatcher(l net.Listener) *Dispatcher {
 	return &Dispatcher{
 		listeners: make(map[string]*listener),
-		netl: l,
+		netl:      l,
 	}
 }
 
+// create listener for specific proto, which can use in http.Server.Serve(net.Listener) and etc..
+// if used RegisterProtoDefault, the sequence of calls is very important, because "http" proto used as default and therefore
+// other protocols should be called before "http"
 func (self *Dispatcher) Listener(proto string) net.Listener {
 	if _, ok := registeredProtos[proto]; !ok {
 		panic(fmt.Sprintf("undefined proto: %s", proto))
@@ -90,8 +95,8 @@ func (self *Dispatcher) Listener(proto string) net.Listener {
 	return l
 }
 
+// listen interface, and rotate between different registered proto
 func (self *Dispatcher) Listen() error {
-	LISTENER:
 	for {
 		conn, err := self.netl.Accept()
 		if err != nil {
@@ -106,29 +111,33 @@ func (self *Dispatcher) Listen() error {
 			return err
 		}
 
-		bufconn := newBufConn(conn)
+		go self.dispatch(conn)
+	}
+}
 
-		for _, proto := range self.lorder {
-			ls := self.listeners[proto]
+func (self *Dispatcher) dispatch(conn net.Conn) {
+	bufconn := newBufConn(conn)
 
-			resolver := registeredProtos[ls.proto]
-			isSuitableProto, err := resolver(bufconn.r)
-			if err != nil {
-				if self.Logger != nil {
-					self.Logger.Println("munproto: " + err.Error())
-				}
+	for _, proto := range self.lorder {
+		ls := self.listeners[proto]
 
-				continue LISTENER
+		resolver := registeredProtos[ls.proto]
+		isSuitableProto, err := resolver(bufconn.r)
+		if err != nil {
+			if self.Logger != nil {
+				self.Logger.Println("munproto: " + err.Error())
 			}
 
-			if isSuitableProto {
-				ls.connCh <- bufconn
-				continue LISTENER
-			}
+			return
 		}
 
-		bufconn.Close()
+		if isSuitableProto {
+			ls.connCh <- bufconn
+			return
+		}
 	}
+
+	bufconn.Close()
 }
 
 type bufConn struct {
@@ -136,6 +145,10 @@ type bufConn struct {
 	net.Conn
 }
 
-func newBufConn(c net.Conn) bufConn {
-	return bufConn{bufio.NewReader(c), c}
+func (self *bufConn) Read(b []byte) (n int, err error) {
+	return self.r.Read(b)
+}
+
+func newBufConn(c net.Conn) *bufConn {
+	return &bufConn{bufio.NewReader(c), c}
 }
