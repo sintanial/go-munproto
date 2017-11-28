@@ -5,48 +5,69 @@ import (
 	"bufio"
 	"fmt"
 	"log"
+	"sync"
+	"strings"
 )
 
-var registeredProtos = make(map[string]func(*bufio.Reader) (bool, error))
+var defaultProtos = make(map[string]func(*bufio.Reader) (bool, error))
 
-// register new protocol
-func RegisterProto(proto string, resolver func(*bufio.Reader) (bool, error)) {
-	registeredProtos[proto] = resolver
-}
-
-// register predefined protocols
-func RegisterProtoDefault() {
-	RegisterProto("socks5", func(r *bufio.Reader) (bool, error) {
+func init() {
+	defaultProtos["socks5"] = func(r *bufio.Reader) (bool, error) {
 		data, err := r.Peek(1)
 		if err != nil {
 			return false, err
 		}
 
 		return data[0] == byte(5), nil
-	})
+	}
 
-	RegisterProto("https", func(r *bufio.Reader) (bool, error) {
+	defaultProtos["socks4"] = func(r *bufio.Reader) (bool, error) {
+		data, err := r.Peek(1)
+		if err != nil {
+			return false, err
+		}
+
+		return data[0] == byte(4), nil
+	}
+
+	defaultProtos["https"] = func(r *bufio.Reader) (bool, error) {
 		data, err := r.Peek(1)
 		if err != nil {
 			return false, err
 		}
 
 		return data[0] == byte(22), nil
-	})
+	}
 
-	RegisterProto("http", func(r *bufio.Reader) (bool, error) {
-		return true, nil
-	})
+	defaultProtos["http"] = func(r *bufio.Reader) (bool, error) {
+		data, err := r.Peek(7)
+		if err != nil {
+			return false, err
+		}
+
+		method := strings.ToUpper(strings.Split(string(data), " ")[0])
+		if method == "GET" || method == "HEAD" || method == "POST" || method == "PUT" || method == "DELETE" || method == "CONNECT" || method == "OPTIONS" || method == "TRACE" || method == "PATCH" {
+			return true, nil
+		}
+
+		return false, nil
+	}
 }
 
 type listener struct {
 	l      net.Listener
 	proto  string
 	connCh chan net.Conn
+	errCh  chan error
 }
 
 func (self *listener) Accept() (net.Conn, error) {
-	return <-self.connCh, nil
+	select {
+	case conn := <-self.connCh:
+		return conn, nil
+	case err := <-self.errCh:
+		return nil, err
+	}
 }
 
 func (self *listener) Addr() net.Addr {
@@ -62,10 +83,14 @@ func newListener(l net.Listener, proto string) *listener {
 		l:      l,
 		proto:  proto,
 		connCh: make(chan net.Conn),
+		errCh:  make(chan error),
 	}
 }
 
 type Dispatcher struct {
+	mu     sync.RWMutex
+	protos map[string]func(*bufio.Reader) (bool, error)
+
 	listeners map[string]*listener
 	lorder    []string
 	netl      net.Listener
@@ -73,18 +98,33 @@ type Dispatcher struct {
 	Logger *log.Logger
 }
 
-func NewDispatcher(l net.Listener) *Dispatcher {
+func New(l net.Listener) *Dispatcher {
 	return &Dispatcher{
+		protos:    make(map[string]func(*bufio.Reader) (bool, error)),
 		listeners: make(map[string]*listener),
 		netl:      l,
 	}
+}
+
+func NewDefault(l net.Listener) *Dispatcher {
+	d := New(l)
+	for name, detectfn := range defaultProtos {
+		d.AddProto(name, detectfn)
+	}
+	return d
+}
+
+func (self *Dispatcher) AddProto(name string, detectfn func(*bufio.Reader) (bool, error)) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	self.protos[name] = detectfn
 }
 
 // create listener for specific proto, which can use in http.Server.Serve(net.Listener) and etc..
 // if used RegisterProtoDefault, the sequence of calls is very important, because "http" proto used as default and therefore
 // other protocols should be called before "http"
 func (self *Dispatcher) Listener(proto string) net.Listener {
-	if _, ok := registeredProtos[proto]; !ok {
+	if _, ok := self.protos[proto]; !ok {
 		panic(fmt.Sprintf("undefined proto: %s", proto))
 	}
 
@@ -100,14 +140,16 @@ func (self *Dispatcher) Listen() error {
 	for {
 		conn, err := self.netl.Accept()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok {
+			if nerr, ok := err.(net.Error); ok {
 				if self.Logger != nil {
-					self.Logger.Println("munproto: " + ne.Error())
+					self.Logger.Println("munproto: " + nerr.Error())
 				}
-
 				continue
 			}
 
+			for _, l := range self.listeners {
+				l.errCh <- err
+			}
 			return err
 		}
 
@@ -121,13 +163,12 @@ func (self *Dispatcher) dispatch(conn net.Conn) {
 	for _, proto := range self.lorder {
 		ls := self.listeners[proto]
 
-		resolver := registeredProtos[ls.proto]
+		resolver := defaultProtos[ls.proto]
 		isSuitableProto, err := resolver(bufconn.r)
 		if err != nil {
 			if self.Logger != nil {
 				self.Logger.Println("munproto: " + err.Error())
 			}
-
 			return
 		}
 
