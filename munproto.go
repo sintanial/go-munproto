@@ -9,49 +9,52 @@ import (
 	"strings"
 )
 
-var defaultProtos = make(map[string]func(*bufio.Reader) (bool, error))
+var defaultProtos = map[string]func(*bufio.Reader) (bool, error){
+	"socks5": IsSOCKS5,
+	"socks4": IsSOCKS4,
+	"https":  IsHTTPS,
+	"http":   IsHTTP,
+}
 
-func init() {
-	defaultProtos["socks5"] = func(r *bufio.Reader) (bool, error) {
-		data, err := r.Peek(1)
-		if err != nil {
-			return false, err
-		}
-
-		return data[0] == byte(5), nil
+func IsSOCKS5(r *bufio.Reader) (bool, error) {
+	data, err := r.Peek(1)
+	if err != nil {
+		return false, err
 	}
 
-	defaultProtos["socks4"] = func(r *bufio.Reader) (bool, error) {
-		data, err := r.Peek(1)
-		if err != nil {
-			return false, err
-		}
+	return data[0] == byte(5), nil
+}
 
-		return data[0] == byte(4), nil
+func IsSOCKS4(r *bufio.Reader) (bool, error) {
+	data, err := r.Peek(1)
+	if err != nil {
+		return false, err
 	}
 
-	defaultProtos["https"] = func(r *bufio.Reader) (bool, error) {
-		data, err := r.Peek(1)
-		if err != nil {
-			return false, err
-		}
+	return data[0] == byte(4), nil
+}
 
-		return data[0] == byte(22), nil
+func IsHTTPS(r *bufio.Reader) (bool, error) {
+	data, err := r.Peek(1)
+	if err != nil {
+		return false, err
 	}
 
-	defaultProtos["http"] = func(r *bufio.Reader) (bool, error) {
-		data, err := r.Peek(7)
-		if err != nil {
-			return false, err
-		}
+	return data[0] == byte(22), nil
+}
 
-		method := strings.ToUpper(strings.Split(string(data), " ")[0])
-		if method == "GET" || method == "HEAD" || method == "POST" || method == "PUT" || method == "DELETE" || method == "CONNECT" || method == "OPTIONS" || method == "TRACE" || method == "PATCH" {
-			return true, nil
-		}
-
-		return false, nil
+func IsHTTP(r *bufio.Reader) (bool, error) {
+	data, err := r.Peek(7)
+	if err != nil {
+		return false, err
 	}
+
+	method := strings.ToUpper(strings.Split(string(data), " ")[0])
+	if method == "GET" || method == "HEAD" || method == "POST" || method == "PUT" || method == "DELETE" || method == "CONNECT" || method == "OPTIONS" || method == "TRACE" || method == "PATCH" {
+		return true, nil
+	}
+
+	return false, nil
 }
 
 type listener struct {
@@ -181,6 +184,7 @@ func (self *Dispatcher) dispatch(conn net.Conn) {
 	bufconn.Close()
 }
 
+// todo: добавить пул
 type bufConn struct {
 	r *bufio.Reader
 	net.Conn
