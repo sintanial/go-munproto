@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"strings"
+	"time"
 )
 
 var defaultProtos = map[string]func(*bufio.Reader) (bool, error){
@@ -15,6 +16,8 @@ var defaultProtos = map[string]func(*bufio.Reader) (bool, error){
 	"https":  IsHTTPS,
 	"http":   IsHTTP,
 }
+
+var DefaultTimeout = 1 * time.Minute
 
 func IsSOCKS5(r *bufio.Reader) (bool, error) {
 	data, err := r.Peek(1)
@@ -91,8 +94,9 @@ func newListener(l net.Listener, proto string) *listener {
 }
 
 type Dispatcher struct {
-	mu     sync.RWMutex
-	protos map[string]func(*bufio.Reader) (bool, error)
+	mu      sync.RWMutex
+	protos  map[string]func(*bufio.Reader) (bool, error)
+	timeout time.Duration
 
 	listeners map[string]*listener
 	lorder    []string
@@ -101,16 +105,17 @@ type Dispatcher struct {
 	Logger *log.Logger
 }
 
-func New(l net.Listener) *Dispatcher {
+func New(l net.Listener, timeout time.Duration) *Dispatcher {
 	return &Dispatcher{
 		protos:    make(map[string]func(*bufio.Reader) (bool, error)),
 		listeners: make(map[string]*listener),
 		netl:      l,
+		timeout:   timeout,
 	}
 }
 
 func NewDefault(l net.Listener) *Dispatcher {
-	d := New(l)
+	d := New(l, DefaultTimeout)
 	for name, detectfn := range defaultProtos {
 		d.AddProto(name, detectfn)
 	}
@@ -163,6 +168,10 @@ func (self *Dispatcher) Listen() error {
 func (self *Dispatcher) dispatch(conn net.Conn) {
 	bufconn := newBufConn(conn)
 
+	if self.timeout > 0 {
+		conn.SetReadDeadline(time.Now().Add(self.timeout))
+	}
+
 	for _, proto := range self.lorder {
 		ls := self.listeners[proto]
 
@@ -176,6 +185,10 @@ func (self *Dispatcher) dispatch(conn net.Conn) {
 		}
 
 		if isSuitableProto {
+			if self.timeout > 0 {
+				conn.SetReadDeadline(time.Time{})
+			}
+
 			ls.connCh <- bufconn
 			return
 		}
